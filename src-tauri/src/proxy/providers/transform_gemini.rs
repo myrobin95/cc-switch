@@ -228,13 +228,13 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(synthesize_tool_call_id);
-            
-// FIX: 无状态化改造。将 thoughtSignature 直接编码到 tool_use 的 ID 中
+
+            // FIX: 无状态化改造。将 thoughtSignature 直接编码到 tool_use 的 ID 中
             let thought_sig = part
                 .get("thoughtSignature")
                 .or_else(|| part.get("thought_signature"))
                 .and_then(|v| v.as_str());
-                
+
             let final_id = if let Some(sig) = thought_sig {
                 format!("{}|sig:{}", id, sig)
             } else {
@@ -686,7 +686,7 @@ fn convert_message_content_to_parts(
 
                 let mut part = json!({ "functionCall": function_call });
 
-// 优先使用解码出的无状态签名，即使 Session 丢失也不会导致 400 报错
+                // 优先使用解码出的无状态签名，即使 Session 丢失也不会导致 400 报错
                 if let Some(sig) = recovered_sig {
                     part["thoughtSignature"] = json!(sig);
                 } else if let Some(sig) = thought_signature_by_id
@@ -741,7 +741,7 @@ fn convert_message_content_to_parts(
 
                 let mut part = json!({ "functionResponse": function_response });
 
-// FIX: 严格遵守 Gemini 要求，为工具结果 (functionResponse) 也挂载签名
+                // FIX: 严格遵守 Gemini 要求，为工具结果 (functionResponse) 也挂载签名
                 if let Some(sig) = recovered_sig {
                     part["thoughtSignature"] = json!(sig);
                 } else if let Some(sig) = thought_signature_by_id
