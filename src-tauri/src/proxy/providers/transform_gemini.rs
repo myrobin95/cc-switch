@@ -228,9 +228,21 @@ pub fn gemini_to_anthropic_with_shadow_and_hints(
                 .filter(|s| !s.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(synthesize_tool_call_id);
+            
+            // FIX: 无状态化改造。将 thoughtSignature 直接编码到 tool_use 的 ID 中
+            let thought_sig = part.get("thoughtSignature")
+                .or_else(|| part.get("thought_signature"))
+                .and_then(|v| v.as_str());
+            
+            let final_id = if let Some(sig) = thought_sig {
+                format!("{}|sig:{}", id, sig)
+            } else {
+                id
+            };
+
             content.push(json!({
                 "type": "tool_use",
-                "id": id,
+                "id": final_id,
                 "name": function_call.get("name").and_then(|value| value.as_str()).unwrap_or(""),
                 "input": function_call.get("args").cloned().unwrap_or_else(|| json!({}))
             }));
@@ -642,21 +654,27 @@ fn convert_message_content_to_parts(
                     ));
                 }
 
-                let id = block
+                let full_id = block
                     .get("id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                    
+                let mut id = full_id;
+                let mut recovered_sig = None;
+                // 从 ID 中解码出之前嵌入的 thought_signature
+                if let Some((real_id, sig)) = full_id.split_once("|sig:") {
+                    id = real_id;
+                    recovered_sig = Some(sig);
+                }
+
                 let name = block
                     .get("name")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                if !id.is_empty() && !name.is_empty() {
-                    tool_name_by_id.insert(id.to_string(), name.to_string());
+                if !full_id.is_empty() && !name.is_empty() {
+                    tool_name_by_id.insert(full_id.to_string(), name.to_string());
                 }
 
-                // A synthesized id is an internal proxy identifier — never
-                // forward it to Gemini. Gemini will disambiguate the missing
-                // id by call order, matching its own earlier response shape.
                 let mut function_call = json!({
                     "name": name,
                     "args": block.get("input").cloned().unwrap_or_else(|| json!({}))
@@ -665,37 +683,41 @@ fn convert_message_content_to_parts(
                     function_call["id"] = json!(id);
                 }
 
-                // Re-attach the thought_signature that Gemini originally
-                // associated with this functionCall.  The Anthropic format
-                // strips it from the tool_use block, but Gemini requires it
-                // on every functionCall in a multi-turn tool-use exchange.
-                // Without replaying the stored signature the upstream may
-                // reject with "missing a `thought_signature`".
-                if let Some(sig) = thought_signature_by_id.get(id) {
-                    function_call["thoughtSignature"] = json!(sig);
+                let mut part = json!({ "functionCall": function_call });
+
+                // FIX: 修复了之前错误放在 functionCall 内部的 JSON 结构 Bug
+                // 优先使用解码出的无状态签名，即使 Session 丢失也不会导致 400 报错
+                if let Some(sig) = recovered_sig {
+                    part["thoughtSignature"] = json!(sig);
+                } else if let Some(sig) = thought_signature_by_id.get(id).or_else(|| thought_signature_by_id.get(full_id)) {
+                    part["thoughtSignature"] = json!(sig);
                 }
 
-                parts.push(json!({ "functionCall": function_call }));
+                parts.push(part);
             }
             "tool_result" => {
-                let tool_use_id = block
+                let full_id = block
                     .get("tool_use_id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
+                    
+                let mut tool_use_id = full_id;
+                let mut recovered_sig = None;
+                if let Some((real_id, sig)) = full_id.split_once("|sig:") {
+                    tool_use_id = real_id;
+                    recovered_sig = Some(sig);
+                }
+
                 let name = tool_name_by_id
-                    .get(tool_use_id)
+                    .get(full_id)
                     .cloned()
+                    .or_else(|| tool_name_by_id.get(tool_use_id).cloned())
                     .or_else(|| {
-                        // Last-resort fallback: scan every block in this content
-                        // array for a tool_use whose id matches.  This catches
-                        // edge cases where the tool_use lives in a different
-                        // content block of the same message (non-standard client
-                        // behaviour) or in a re-ordered message array.
                         blocks.iter().find_map(|b| {
                             let t = b.get("type").and_then(|v| v.as_str())?;
                             if t != "tool_use" { return None; }
-                            let id = b.get("id").and_then(|v| v.as_str())?;
-                            if id != tool_use_id { return None; }
+                            let id_in_block = b.get("id").and_then(|v| v.as_str())?;
+                            if id_in_block != full_id && id_in_block != tool_use_id { return None; }
                             b.get("name").and_then(|v| v.as_str()).map(|n| n.to_string())
                         })
                     })
@@ -705,16 +727,25 @@ fn convert_message_content_to_parts(
                         ))
                     })?;
 
-                // See `tool_use` above: synthesized ids must not leak upstream.
                 let mut function_response = json!({
                     "name": name,
                     "response": normalize_tool_result_response(block.get("content"))
                 });
+                
                 if !tool_use_id.is_empty() && !is_synthesized_tool_call_id(tool_use_id) {
                     function_response["id"] = json!(tool_use_id);
                 }
 
-                parts.push(json!({ "functionResponse": function_response }));
+                let mut part = json!({ "functionResponse": function_response });
+
+                // FIX: 严格遵守 Gemini 要求，为工具结果 (functionResponse) 也挂载签名
+                if let Some(sig) = recovered_sig {
+                    part["thoughtSignature"] = json!(sig);
+                } else if let Some(sig) = thought_signature_by_id.get(tool_use_id).or_else(|| thought_signature_by_id.get(full_id)) {
+                    part["thoughtSignature"] = json!(sig);
+                }
+
+                parts.push(part);
             }
             "thinking" | "redacted_thinking" => {}
             _ => {}
