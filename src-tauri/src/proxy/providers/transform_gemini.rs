@@ -734,7 +734,7 @@ fn convert_message_content_to_parts(
                     "name": name,
                     "response": normalize_tool_result_response(block.get("content"))
                 });
-                
+
                 if !tool_use_id.is_empty() && !is_synthesized_tool_call_id(tool_use_id) {
                     function_response["id"] = json!(tool_use_id);
                 }
